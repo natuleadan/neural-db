@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   lint:
@@ -86,16 +87,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  tag:
-    name: Tag
-    needs: [lint, test, docker]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+  release:
+    name: Release
+    needs: [docker]
+    # Runs right after the Sunday/dispatch docker build — no cross-workflow race
+    if: >
+      github.ref == 'refs/heads/main' &&
+      (github.event.schedule == '0 22 * * 0' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
 
       - name: Configure git
         run: |
@@ -105,33 +111,38 @@ jobs:
       - name: Determine version
         id: version
         run: |
-          LATEST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST#v}"
-          if [ "$LATEST" = "v0.0.0" ]; then
-            echo "tag=v0.0.1" >> "$GITHUB_OUTPUT"
-            echo "First release: v0.0.1"
-            exit 0
-          fi
-          COMMITS=$(git log "$LATEST..HEAD" --format="%s%b" 2>/dev/null || true)
+          LATEST=$(git tag --list 'v*' | sort -V | tail -1 || true)
+          if [ -z "$LATEST" ]; then BASE="v0.0.0"; else BASE="$LATEST"; fi
+          BASE_NUM="${BASE#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${BASE_NUM:-0.0.0}"
+          MAJOR="${MAJOR:-0}"; MINOR="${MINOR:-0}"; PATCH="${PATCH:-0}"
+          if [ -z "$LATEST" ]; then RANGE="HEAD"; else RANGE="${LATEST}..HEAD"; fi
+          COMMITS=$(git log "$RANGE" --format='%s%b' 2>/dev/null || true)
           if [ -z "$COMMITS" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "No new commits since $LATEST"
+            echo "No new commits"
             exit 0
           fi
           if echo "$COMMITS" | grep -qE '^.*?\([^)]*\)?!:|^BREAKING[ -]CHANGE:'; then
-            if [ "$MAJOR" = "0" ]; then
-              echo "tag=v0.$((MINOR+1)).0" >> "$GITHUB_OUTPUT"
-            else
-              echo "tag=v$((MAJOR+1)).0.0" >> "$GITHUB_OUTPUT"
-            fi
+            if [ "$MAJOR" = "0" ]; then TAG="v0.$((MINOR+1)).0"; else TAG="v$((MAJOR+1)).0.0"; fi
           elif echo "$COMMITS" | grep -q '^feat'; then
-            echo "tag=v$MAJOR.$((MINOR+1)).0" >> "$GITHUB_OUTPUT"
+            TAG="v$MAJOR.$((MINOR+1)).0"
           elif echo "$COMMITS" | grep -qE '^fix|^perf'; then
-            echo "tag=v$MAJOR.$MINOR.$((PATCH+1))" >> "$GITHUB_OUTPUT"
+            TAG="v$MAJOR.$MINOR.$((PATCH+1))"
           else
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "No functional changes"
+            exit 0
           fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${LATEST:-<none>} -> $TAG"
+
+      - name: Re-tag image with semver
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          docker buildx imagetools create \
+            "ghcr.io/natuleadan/neural-db:${{ github.sha }}" \
+            --tag "ghcr.io/natuleadan/neural-db:${{ steps.version.outputs.tag }}"
 
       - name: Tag and push
         if: steps.version.outputs.skip != 'true'
