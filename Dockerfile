@@ -4,7 +4,7 @@ COPY go.mod ./
 COPY main.go ./
 RUN CGO_ENABLED=0 go build -o neural-db .
 
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/neural-db /usr/local/bin/neural-db
 ENTRYPOINT ["neural-db"]
